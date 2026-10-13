@@ -60,7 +60,7 @@ class ToroidalHexagonalTopology(TopologyStrategy):
         grid = []
         center_r = (rows - 1) / 2.0
         center_c = (cols - 1) / 2.0
-        row_height = cell_size * (np.sqrt(3) / 3.0)
+        row_height = cell_size * (np.sqrt(3) / 2.0)
 
         # Step 1: Physical placement
         for r in range(rows):
