@@ -149,6 +149,4 @@ class PygameVisualizer:
             self.clock.tick(50)
 
         pygame.quit()
-        sys.exit()
-
-
+        sys.exit() 
