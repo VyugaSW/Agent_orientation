@@ -1,7 +1,8 @@
+from collections import deque
 import numpy as np
-from typing import List, Tuple, Optional
+from typing import List, Optional, Tuple, Set
 
-from Topology import TopologyStrategy, ToroidalSquareTopology
+from Topology import TopologyStrategy
 from Neuron import Neuron
 
 
@@ -17,38 +18,49 @@ class Orientation_membrane:
     ):
         self.rows = rows
         self.cols = cols
-        self.cell_size = cell_size
+        self.cell_size = float(cell_size)
         self.topology = topology
         self.center = np.array([start_x, start_y], dtype=float)
 
         # Delegate initialization to the injected topology strategy
         self.grid: List[List[Neuron]] = self.topology.build_grid(
-            rows, cols, cell_size, start_x, start_y
+            rows, cols, self.cell_size, start_x, start_y
         )
+        self.flat_neurons: List[Neuron] = [
+            neuron for row in self.grid for neuron in row
+        ]
+
+    def rebuild(
+        self,
+        rows: int,
+        cols: int,
+        cell_size: float,
+        topology: Optional[TopologyStrategy] = None,
+    ) -> None:
+        """Rebuilds the membrane with new dimensions or topology around the current center."""
+        self.rows = rows
+        self.cols = cols
+        self.cell_size = float(cell_size)
+        if topology is not None:
+            self.topology = topology
+        self.grid = self.topology.build_grid(
+            rows, cols, self.cell_size, float(self.center[0]), float(self.center[1])
+        )
+        self.flat_neurons = [neuron for row in self.grid for neuron in row]
 
     def find_bmu(
-        self, target_coords: np.ndarray, neurons: list = None
+        self, target_coords: np.ndarray, neurons: Optional[List[Neuron]] = None
     ) -> Optional[Neuron]:
         """
         Finds the Best Matching Unit (BMU) for a given stimulus target.
         Utilizes the modified distance that accounts for k_fear and k_desire.
         """
-        best_neuron = None
+        candidates = neurons if neurons is not None else self.flat_neurons
+        best_neuron: Optional[Neuron] = None
         min_dist = float("inf")
 
-        # for r in range(self.rows):
-        #     for c in range(self.cols):
-        #         neuron = self.grid[r][c]
-        #         dist = neuron.get_modified_distance(target_coords)
-
-        #         if dist < min_dist:
-        #             min_dist = dist
-        #             best_neuron = neuron
-
-        for n in neurons:
-            neuron = n
+        for neuron in candidates:
             dist = neuron.get_modified_distance(target_coords)
-
             if dist < min_dist:
                 min_dist = dist
                 best_neuron = neuron
@@ -60,123 +72,147 @@ class Orientation_membrane:
         target_coords: np.ndarray,
         learning_rate: float = 0.1,
         radius_hops: int = 2,
-        neurons: list = None,
+        neurons: Optional[List[Neuron]] = None,
+        bmu: Optional[Neuron] = None,
     ) -> None:
         """
-        Applies SOM pull to the BMU and its topological neighbors.
-        Uses BFS with a physical distance cut-off to prevent Toroidal phantom links
+        Applies SOM pull to the BMU and its topological neighbors using an O(1) deque BFS.
+        Uses a physical distance cut-off (The Scissors Rule) to prevent Toroidal phantom links
         from ripping the physical mesh apart.
         """
-        bmu = self.find_bmu(target_coords, neurons)
-        if not bmu:
+        if bmu is None:
+            bmu = self.find_bmu(target_coords, neurons)
+        if bmu is None:
             return
 
-        # Queue stores tuples of (Neuron, topological_distance_from_BMU)
-        queue = [(bmu, 0)]
-        visited = set([bmu])
-
-        # Max acceptable physical distance between neighbors before considering it a phantom link
-        # Cell size * 1.5 covers standard spacing and slight deformations, but blocks wrap-around links
+        queue = deque([(bmu, 0)])
+        visited: Set[Neuron] = {bmu}
         phantom_link_threshold = self.cell_size * 1.5
 
         while queue:
-            current_neuron, hop_dist = queue.pop(0)
+            current_neuron, hop_dist = queue.popleft()
 
-            # Calculate weight (Gaussian falloff based on topological hops)
-            # hop_dist == 0 (BMU) gets weight 1.0 * learning_rate
-            # hop_dist == 1 gets weight 0.5 * learning_rate, etc.
-            falloff = np.exp(-(hop_dist**2) / 2.0)
+            # Gaussian falloff based on topological hops
+            falloff = np.exp(-(hop_dist ** 2) / 2.0)
             weight = learning_rate * falloff
-
-            # Pull the current neuron physically towards the target
             current_neuron.pull_towards(target_coords, weight)
 
-            # Stop propagating if we reached the edge of the influence radius
             if hop_dist >= radius_hops:
                 continue
 
-            # Check neighbors
             for neighbor in current_neuron.neighbors:
                 if neighbor not in visited:
                     # RULE: The Scissors (Physical Cut-off)
-                    # Measure pure Euclidean distance between connected nodes
                     dist = current_neuron.get_euclidean_distance(neighbor.position)
-
                     if dist < phantom_link_threshold:
                         visited.add(neighbor)
                         queue.append((neighbor, hop_dist + 1))
 
     def scroll_forward(self, step_vector: np.ndarray) -> None:
         """
-        Implements Toroidal O(1) memory shift.
-        We do not move array elements or change topological pointers.
-        We only teleport the physical coordinates of neurons that fall behind.
+        Implements Toroidal O(N) memory shift.
+        Synchronously teleports both physical coordinates and ideal lattice anchors
+        of trailing neurons to the leading edge.
         """
-        # 1. Update the absolute center of the radar
         self.center += step_vector
+        for neuron in self.flat_neurons:
+            neuron.anchor += step_vector
 
-        # 2. Calculate physical boundaries of the radar
-        half_width = (self.cols / 2.0) * self.cell_size
-        half_height = (self.rows / 2.0) * self.cell_size
+        radar_width, radar_height = self.topology.get_periods(
+            self.rows, self.cols, self.cell_size
+        )
+        half_width = radar_width / 2.0
+        half_height = radar_height / 2.0
 
-        radar_width = self.cols * self.cell_size
-        radar_height = self.rows * self.cell_size
+        cx, cy = float(self.center[0]), float(self.center[1])
 
-        # 3. Teleport trailing neurons to the leading edge
-        for r in range(self.rows):
-            for c in range(self.cols):
-                neuron = self.grid[r][c]
-
-                # Teleport along X-axis
-                if neuron.position[0] < self.center[0] - half_width:
-                    neuron.position[0] += radar_width
-                    neuron.k_fear = 1.0
-                    neuron.k_desire = 1.0
-                elif neuron.position[0] > self.center[0] + half_width:
-                    neuron.position[0] -= radar_width
-                    neuron.k_fear = 1.0
-                    neuron.k_desire = 1.0
-
-                # Teleport along Y-axis
-                if neuron.position[1] < self.center[1] - half_height:
-                    neuron.position[1] += radar_height
-                    neuron.k_fear = 1.0
-                    neuron.k_desire = 1.0
-                elif neuron.position[1] > self.center[1] + half_height:
-                    neuron.position[1] -= radar_height
-                    neuron.k_fear = 1.0
-                    neuron.k_desire = 1.0
-
-    def reset_grid(self) -> None:
-        """Restores the physical grid to a perfect un-deformed state around the center."""
-        center_r = (self.rows - 1) / 2.0
-        center_c = (self.cols - 1) / 2.0
-        for r in range(self.rows):
-            for c in range(self.cols):
-                neuron = self.grid[r][c]
-                neuron.position[0] = self.center[0] + (c - center_c) * self.cell_size
-                neuron.position[1] = self.center[1] + (r - center_r) * self.cell_size
+        for neuron in self.flat_neurons:
+            # Teleport physical position along X-axis
+            if neuron.position[0] < cx - half_width:
+                neuron.position[0] += radar_width
+                neuron.k_fear = 1.0
+                neuron.k_desire = 1.0
+            elif neuron.position[0] > cx + half_width:
+                neuron.position[0] -= radar_width
                 neuron.k_fear = 1.0
                 neuron.k_desire = 1.0
 
+            # Teleport physical position along Y-axis
+            if neuron.position[1] < cy - half_height:
+                neuron.position[1] += radar_height
+                neuron.k_fear = 1.0
+                neuron.k_desire = 1.0
+            elif neuron.position[1] > cy + half_height:
+                neuron.position[1] -= radar_height
+                neuron.k_fear = 1.0
+                neuron.k_desire = 1.0
+
+            # Synchronously wrap the lattice anchor around the torus
+            if neuron.anchor[0] < cx - half_width:
+                neuron.anchor[0] += radar_width
+            elif neuron.anchor[0] > cx + half_width:
+                neuron.anchor[0] -= radar_width
+
+            if neuron.anchor[1] < cy - half_height:
+                neuron.anchor[1] += radar_height
+            elif neuron.anchor[1] > cy + half_height:
+                neuron.anchor[1] -= radar_height
+
+    def reset_grid(self) -> None:
+        """Restores the physical grid to an undeformed state around the current center."""
+        for neuron in self.flat_neurons:
+            neuron.position[:] = self.center + neuron.base_offset
+            neuron.anchor[:] = neuron.position
+            neuron.k_fear = 1.0
+            neuron.k_desire = 1.0
+
     def apply_homeostasis(self, relaxation_rate: float = 0.2) -> None:
         """
-        Anchor force: Pulls each neuron back to its ideal geometric position
-        relative to the membrane's absolute center (the agent).
-        Prevents infinite drift and structural collapse.
+        Anchor force: Pulls each neuron back towards its current toroidal lattice anchor.
+        Prevents structural collapse without snapping teleported neurons back across the grid.
         """
-        center_r = (self.rows - 1) / 2.0
-        center_c = (self.cols - 1) / 2.0
+        for neuron in self.flat_neurons:
+            neuron.position += (neuron.anchor - neuron.position) * relaxation_rate
 
-        for r in range(self.rows):
-            for c in range(self.cols):
-                neuron = self.grid[r][c]
+    def compute_homology_betti(
+        self, fear_threshold: float = 2.0
+    ) -> Tuple[int, int, List[List[Neuron]]]:
+        """
+        Computes simplicial Betti numbers (beta_0, beta_1) of the safe membrane subgraph:
+        - beta_0: number of connected safe components (homological obstacle-avoidance classes)
+        - beta_1: number of independent cycles (mesh integrity via Euler characteristic)
+        """
+        safe_set: Set[Neuron] = {
+            n for n in self.flat_neurons if n.k_fear <= fear_threshold
+        }
+        if not safe_set:
+            return 0, 0, []
 
-                # Calculate where this node SHOULD be mathematically
-                ideal_x = self.center[0] + (c - center_c) * self.cell_size
-                ideal_y = self.center[1] + (r - center_r) * self.cell_size
-                ideal_pos = np.array([ideal_x, ideal_y], dtype=float)
+        phantom_threshold = self.cell_size * 1.5
+        visited: Set[Neuron] = set()
+        components: List[List[Neuron]] = []
+        edge_count = 0
 
-                # Slowly drag the node back to its ideal position
-                # This fights back against the BMU pull and obstacle repulsion
-                neuron.position += (ideal_pos - neuron.position) * relaxation_rate
+        for neuron in safe_set:
+            for nb in neuron.neighbors:
+                if nb in safe_set and id(neuron) < id(nb):
+                    if neuron.get_euclidean_distance(nb.position) < phantom_threshold:
+                        edge_count += 1
+
+            if neuron not in visited:
+                comp: List[Neuron] = []
+                q = deque([neuron])
+                visited.add(neuron)
+                while q:
+                    curr = q.popleft()
+                    comp.append(curr)
+                    for nb in curr.neighbors:
+                        if nb in safe_set and nb not in visited:
+                            if curr.get_euclidean_distance(nb.position) < phantom_threshold:
+                                visited.add(nb)
+                                q.append(nb)
+                components.append(comp)
+
+        beta_0 = len(components)
+        beta_1 = max(0, edge_count - len(safe_set) + beta_0)
+        return beta_0, beta_1, components

@@ -1,14 +1,21 @@
 import unittest
 import numpy as np
 
-# Assuming the files are named exactly as in your project
 from Neuron import Neuron
-from Topology import ToroidalSquareTopology, ToroidalHexagonalTopology
+from Topology import (
+    ToroidalSquareTopology,
+    ToroidalHexagonalTopology,
+    ParameterizedMorphologyTopology,
+)
 from Orientation_membrane import Orientation_membrane
 from InfluenceEntity import DangerEntity, AttractorEntity
 from Environment import CostmapEnvironment, SpatialHashEnvironment
 from Agent import Agent
-from Visualizer import PygameVisualizer
+from TopologyOptimizer import (
+    TopologicalMapAnalyzer,
+    HomologyMembraneConfigurator,
+    EvolutionaryMembraneOptimizer,
+)
 
 
 class TestNeuron(unittest.TestCase):
@@ -31,7 +38,6 @@ class TestTopology(unittest.TestCase):
     def test_toroidal_links(self):
         """Test Toroidal wrap-around linking."""
         strategy = ToroidalSquareTopology()
-        # 3x3 Grid
         grid = strategy.build_grid(
             rows=3, cols=3, cell_size=1.0, start_x=0.0, start_y=0.0
         )
@@ -65,13 +71,26 @@ class TestInfluenceEntity(unittest.TestCase):
         # 0.9 * (1 - 0/10) = 0.9. calculated_desire = 1.0 - 0.9 = 0.1
         self.assertAlmostEqual(neuron.k_desire, 0.1)
 
+    def test_dynamic_movement_and_blinking(self):
+        """Test moving and disappearing/reappearing obstacle mechanics."""
+        entity = DangerEntity(
+            x=20.0, y=20.0, radius=5.0, peak_strength=50.0, vx=1.0, vy=-0.5, blink_period=2
+        )
+        self.assertTrue(entity.is_active)
+        entity.step()
+        self.assertAlmostEqual(entity.position[0], 21.0)
+        self.assertAlmostEqual(entity.position[1], 19.5)
+        entity.step()
+        # After 2 ticks (blink_period=2), entity toggles to inactive
+        self.assertFalse(entity.is_active)
+
 
 class TestEnvironment(unittest.TestCase):
     def test_costmap_environment(self):
         """Test O(1) costmap evaluation and out-of-bounds handling."""
         map_matrix = np.ones((10, 10), dtype=float)
         map_matrix[5][5] = 50.0  # Obstacle
-        map_matrix[1][1] = 0.5  # Zone of interest
+        map_matrix[1][1] = 0.5   # Zone of interest
 
         env = CostmapEnvironment(map_matrix, resolution=1.0)
 
@@ -97,12 +116,9 @@ class TestOrientationMembrane(unittest.TestCase):
             start_y=0.0,
             topology=self.topology,
         )
-        # Force initialization of center until the bug is fixed in the main code
-        self.membrane.center = np.array([0.0, 0.0], dtype=float)
 
     def test_scroll_forward_teleportation(self):
-        """Test Toroidal memory shift (teleportation of trailing neurons)."""
-        # Agent steps right by 1 cell
+        """Test Toroidal memory shift and homeostasis anchor consistency."""
         step = np.array([2.0, 0.0])
 
         # The left edge of the radar is at X = -4.0 before the step
@@ -111,20 +127,19 @@ class TestOrientationMembrane(unittest.TestCase):
 
         self.membrane.scroll_forward(step)
 
-        # After the step, the center shifted by +2.0.
-        # The old left edge (-4.0) is now behind the visibility bound and must teleport forward.
         # Radar width = 5 * 2 = 10.0. New coordinate: -4.0 + 10.0 = 6.0.
         self.assertEqual(left_edge_neuron.position[0], 6.0)
-        self.assertEqual(left_edge_neuron.k_fear, 1.0)  # Memory wipe check
+        self.assertEqual(left_edge_neuron.k_fear, 1.0)
+
+        # Verify homeostasis does NOT pull the teleported neuron back to the left edge
+        self.membrane.apply_homeostasis(relaxation_rate=0.5)
+        self.assertEqual(left_edge_neuron.position[0], 6.0)
 
     def test_adapt_membrane_phantom_cut_off(self):
         """Test the Scissors Rule: adaptation pull must stop at Toroidal phantom links."""
         target = np.array([0.0, 0.0])
-        # Trigger pull with a 4-hop radius to reach the grid edges
         self.membrane.adapt_membrane(target, learning_rate=0.5, radius_hops=4)
 
-        # Node on the left edge (-4, 0) and right edge (4, 0) are physically distant
-        # Thanks to BFS with distance limit (phantom_link_threshold), they will not pull each other.
         dist = self.membrane.grid[2][0].get_euclidean_distance(
             self.membrane.grid[2][4].position
         )
@@ -143,16 +158,37 @@ class TestAgent(unittest.TestCase):
             start_y=0.0,
             topology=ToroidalSquareTopology(),
         )
-        membrane.center = np.array([0.0, 0.0], dtype=float)
         agent = Agent(x=0.0, y=0.0, membrane=membrane, environment=env)
 
-        agent.set_target(10.0, 0.0)  # Target is far to the right
+        agent.set_target(10.0, 0.0)
         agent.step()
 
-        # The agent must step towards the target
         self.assertGreater(agent.position[0], 0.0)
-        # The radar center must shift following the agent
         self.assertGreater(agent.membrane.center[0], 0.0)
+
+
+class TestTopologyAndHomologyOptimizer(unittest.TestCase):
+    def test_homology_configurator_and_betti(self):
+        """Test persistent homology map analysis and membrane Betti numbers."""
+        env = SpatialHashEnvironment(sector_size=20.0)
+        membrane = Orientation_membrane(
+            rows=4,
+            cols=5,
+            cell_size=5.0,
+            start_x=10.0,
+            start_y=50.0,
+            topology=ToroidalHexagonalTopology(),
+        )
+        agent = Agent(x=10.0, y=50.0, membrane=membrane, environment=env)
+        build_level_2_u_trap(env, agent)
+
+        info = HomologyMembraneConfigurator.apply_to_agent(agent, env)
+        self.assertGreaterEqual(info["rows"], 4)
+        self.assertEqual(info["rows"] % 2, 0)
+
+        b0, b1, _ = agent.membrane.compute_homology_betti()
+        self.assertGreaterEqual(b0, 1)
+        self.assertGreaterEqual(b1, 0)
 
 
 def add_arena_borders(env: SpatialHashEnvironment) -> None:
@@ -186,7 +222,7 @@ def build_level_1_stripe(env: SpatialHashEnvironment, agent: Agent) -> None:
     for y in range(15, 86, 5):
         env.add_entity(DangerEntity(x=40.0, y=float(y), radius=8.0, peak_strength=80.0))
 
-    # Reset agent position and target
+    env.rebuild_spatial_hash()
     agent.position = np.array([10.0, 50.0], dtype=float)
     agent.membrane.center = np.array([10.0, 50.0], dtype=float)
     agent.set_target(70.0, 50.0)
@@ -208,6 +244,7 @@ def build_level_2_u_trap(env: SpatialHashEnvironment, agent: Agent) -> None:
     for x in range(30, 51, 5):
         env.add_entity(DangerEntity(x=float(x), y=70.0, radius=7.0, peak_strength=80.0))
 
+    env.rebuild_spatial_hash()
     agent.position = np.array([20.0, 50.0], dtype=float)
     agent.membrane.center = np.array([20.0, 50.0], dtype=float)
     agent.set_target(70.0, 50.0)
@@ -219,7 +256,6 @@ def build_level_3_forest(env: SpatialHashEnvironment, agent: Agent) -> None:
     env.active_entities.clear()
     add_arena_borders(env)
 
-    # Randomly placed distinct obstacles
     positions = [(25, 40), (25, 60), (45, 50), (45, 30), (45, 70), (60, 45)]
     for pos in positions:
         env.add_entity(
@@ -228,6 +264,7 @@ def build_level_3_forest(env: SpatialHashEnvironment, agent: Agent) -> None:
             )
         )
 
+    env.rebuild_spatial_hash()
     agent.position = np.array([10.0, 50.0], dtype=float)
     agent.membrane.center = np.array([10.0, 50.0], dtype=float)
     agent.set_target(75.0, 50.0)
@@ -235,7 +272,7 @@ def build_level_3_forest(env: SpatialHashEnvironment, agent: Agent) -> None:
 
 
 def build_level_4_something(env: SpatialHashEnvironment, agent: Agent) -> None:
-    """Level 4: Something"""
+    """Level 4: Complex obstacle field."""
     env.active_entities.clear()
     add_arena_borders(env)
 
@@ -247,6 +284,68 @@ def build_level_4_something(env: SpatialHashEnvironment, agent: Agent) -> None:
             )
         )
 
+    env.rebuild_spatial_hash()
+    agent.position = np.array([10.0, 50.0], dtype=float)
+    agent.membrane.center = np.array([10.0, 50.0], dtype=float)
+    agent.set_target(75.0, 50.0)
+    agent.membrane.reset_grid()
+
+
+def build_level_5_dynamic_swarm(env: SpatialHashEnvironment, agent: Agent) -> None:
+    """
+    Level 5: Dynamic Swarm.
+    Combines vertically patrolling obstacles, diagonally bouncing hazards,
+    and blinking (appearing/disappearing) gate obstacles.
+    """
+    env.active_entities.clear()
+    add_arena_borders(env)
+
+    # 1. Vertically patrolling obstacles crossing the agent's main corridor
+    env.add_entity(
+        DangerEntity(x=26.0, y=25.0, radius=7.5, peak_strength=75.0, vx=0.0, vy=0.32)
+    )
+    env.add_entity(
+        DangerEntity(x=42.0, y=65.0, radius=8.0, peak_strength=75.0, vx=0.0, vy=-0.36)
+    )
+    env.add_entity(
+        DangerEntity(x=58.0, y=35.0, radius=7.5, peak_strength=75.0, vx=0.18, vy=0.28)
+    )
+
+    # 2. Blinking (appearing/disappearing) obstacles acting as dynamic gates
+    env.add_entity(
+        DangerEntity(
+            x=34.0,
+            y=48.0,
+            radius=8.5,
+            peak_strength=85.0,
+            blink_period=85,
+            blink_offset=0,
+        )
+    )
+    env.add_entity(
+        DangerEntity(
+            x=50.0,
+            y=45.0,
+            radius=8.5,
+            peak_strength=85.0,
+            blink_period=95,
+            blink_offset=45,
+        )
+    )
+    env.add_entity(
+        DangerEntity(
+            x=50.0,
+            y=60.0,
+            radius=7.5,
+            peak_strength=80.0,
+            vx=-0.15,
+            vy=0.15,
+            blink_period=110,
+            blink_offset=20,
+        )
+    )
+
+    env.rebuild_spatial_hash()
     agent.position = np.array([10.0, 50.0], dtype=float)
     agent.membrane.center = np.array([10.0, 50.0], dtype=float)
     agent.set_target(75.0, 50.0)
@@ -254,26 +353,27 @@ def build_level_4_something(env: SpatialHashEnvironment, agent: Agent) -> None:
 
 
 def main():
+    from Visualizer import PygameVisualizer
+
     # 1. Initialize the Environment
     env = SpatialHashEnvironment(sector_size=20.0)
 
     # 2. Initialize the Membrane (Radar)
-    # Increased size to 21x21 for better visibility of deformation around large obstacles
-    # topology = ToroidalSquareTopology()
     topology = ToroidalHexagonalTopology()
     membrane = Orientation_membrane(
-        rows=4, cols=5, cell_size=6.5, start_x=10.0, start_y=10.0, topology=topology
+        rows=4, cols=5, cell_size=6.5, start_x=10.0, start_y=50.0, topology=topology
     )
 
     # 3. Initialize the Agent
     agent = Agent(x=10.0, y=50.0, membrane=membrane, environment=env)
 
-    # 4. Map the level loader functions to keyboard keys
+    # 4. Map the level loader functions to keyboard keys (1 to 5)
     level_loaders = {
         1: lambda: build_level_1_stripe(env, agent),
         2: lambda: build_level_2_u_trap(env, agent),
         3: lambda: build_level_3_forest(env, agent),
         4: lambda: build_level_4_something(env, agent),
+        5: lambda: build_level_5_dynamic_swarm(env, agent),
     }
 
     # Load Level 1 by default
@@ -283,8 +383,6 @@ def main():
     app = PygameVisualizer(
         agent=agent, environment=env, width=800, height=800, pixels_per_meter=10.0
     )
-
-    # Pass the level dictionary to the run loop
     app.run(level_loaders)
 
 
